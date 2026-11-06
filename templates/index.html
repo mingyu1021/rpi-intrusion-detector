@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>침입 감지 시스템</title>
+<style>
+  :root { color-scheme: dark; --surface: #1a1a19; --text: #f0efec; --muted: #c3c2b7;
+          --line: #3987e5; --critical: #e66767; --grid: #33332f; }
+  body { margin: 0; padding: 16px; background: #111110; color: var(--text);
+         font-family: system-ui, "Noto Sans CJK KR", sans-serif; }
+  main { max-width: 640px; margin: auto; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  #banner { padding: 14px; border-radius: 8px; background: #2b2b29; font-size: 18px; font-weight: 600; }
+  #banner.armed { background: #17603a; }
+  #banner.alarm { background: #b3261e; }
+  #banner.error { background: #8a5a00; }
+  #warning { color: #f2b84b; min-height: 22px; margin: 8px 0; }
+  .stats { display: flex; gap: 24px; margin-bottom: 8px; }
+  .stats div { color: var(--muted); font-size: 13px; }
+  .stats strong { display: block; color: var(--text); font-size: 28px; font-weight: 600; }
+  .chart { position: relative; background: var(--surface); border-radius: 8px; }
+  svg { display: block; width: 100%; height: auto; touch-action: pan-y; }
+  #tooltip { position: absolute; top: 8px; display: none; padding: 6px 8px; border-radius: 6px;
+             background: #2b2b29; font-size: 13px; pointer-events: none; white-space: nowrap; }
+  #tooltip strong { font-size: 15px; }
+  .caption { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .buttons { display: flex; gap: 8px; margin: 12px 0; }
+  button { flex: 1; padding: 12px; font-size: 16px; border: 0; border-radius: 8px;
+           background: #2a78d6; color: #fff; cursor: pointer; }
+  button:disabled { background: #2b2b29; color: #85847c; cursor: default; }
+  #disarm:not(:disabled) { background: #5c5b55; }
+  h2 { font-size: 16px; margin: 20px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<main>
+  <h1>침입 감지 시스템</h1>
+  <div id="banner">연결 중…</div>
+  <div id="warning"></div>
+  <div class="stats">
+    <div><strong id="distance">-</strong>현재 거리</div>
+    <div><strong id="baseline">-</strong>기준 거리</div>
+  </div>
+  <div class="chart" id="chart">
+    <svg id="plot" viewBox="0 0 640 260" role="img" aria-label="최근 거리 변화 그래프"></svg>
+    <div id="tooltip"></div>
+  </div>
+  <div class="caption">최근 거리 변화(cm). 회색 띠는 정상 범위, 벗어나면 침입으로 판단합니다.</div>
+  <div class="buttons">
+    <button id="arm">감시 시작</button>
+    <button id="disarm">감시 해제</button>
+  </div>
+  <h2>감지 기록</h2>
+  <table>
+    <thead><tr><th>시간</th><th>거리</th><th>기준</th></tr></thead>
+    <tbody id="events"></tbody>
+  </table>
+</main>
+<script>
+const NS = "http://www.w3.org/2000/svg";
+const plot = document.getElementById("plot");
+const tooltip = document.getElementById("tooltip");
+const box = { left: 44, right: 628, top: 14, bottom: 232 };
+let latest = null, hoverX = null;
+
+function shape(name, attrs, text) {
+  const el = document.createElementNS(NS, name);
+  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+  if (text !== undefined) el.textContent = text;
+  plot.appendChild(el);
+  return el;
+}
+
+function scales(s) {
+  const points = s.history.filter(p => p.distance !== null);
+  const values = points.map(p => p.distance);
+  if (s.baseline !== null) values.push(s.baseline - s.tolerance, s.baseline + s.tolerance);
+  let low = Math.min(...values), high = Math.max(...values);
+  const margin = Math.max((high - low) * 0.15, 5);
+  low = Math.max(0, low - margin);
+  high += margin;
+  const start = s.history[0].time, end = s.history[s.history.length - 1].time;
+  return {
+    low, high, start, end,
+    x: t => box.left + (t - start) / Math.max(end - start, 1) * (box.right - box.left),
+    y: d => box.bottom - (d - low) / (high - low) * (box.bottom - box.top),
+  };
+}
+
+function ticks(low, high) {
+  const raw = (high - low) / 4, power = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map(m => m * power).find(v => v >= raw);
+  const result = [];
+  for (let v = Math.ceil(low / step) * step; v <= high; v += step) result.push(v);
+  return result;
+}
+
+function draw(s) {
+  plot.replaceChildren();
+  if (!s.history.some(p => p.distance !== null)) {
+    shape("text", { x: 320, y: 130, fill: "#c3c2b7", "text-anchor": "middle", "font-size": 14 },
+          "감시를 시작하면 거리 변화가 표시됩니다");
+    return;
+  }
+  const sc = scales(s);
+  for (const v of ticks(sc.low, sc.high)) {
+    shape("line", { x1: box.left, x2: box.right, y1: sc.y(v), y2: sc.y(v), stroke: "#33332f" });
+    shape("text", { x: box.left - 8, y: sc.y(v) + 4, fill: "#c3c2b7", "text-anchor": "end", "font-size": 12 }, v);
+  }
+  if (s.baseline !== null) {
+    const top = sc.y(s.baseline + s.tolerance), bottom = sc.y(s.baseline - s.tolerance);
+    shape("rect", { x: box.left, y: top, width: box.right - box.left, height: bottom - top, fill: "#c3c2b7", opacity: 0.14 });
+    shape("line", { x1: box.left, x2: box.right, y1: sc.y(s.baseline), y2: sc.y(s.baseline),
+                    stroke: "#c3c2b7", "stroke-dasharray": "4 4" });
+  }
+  // 측정이 끊긴 구간은 잇지 않고 선을 나눔
+  let path = "", pen = false;
+  for (const p of s.history) {
+    if (p.distance === null) { pen = false; continue; }
+    path += `${pen ? "L" : "M"}${sc.x(p.time).toFixed(1)} ${sc.y(p.distance).toFixed(1)}`;
+    pen = true;
+  }
+  shape("path", { d: path, fill: "none", stroke: "#3987e5", "stroke-width": 2,
+                  "stroke-linejoin": "round", "stroke-linecap": "round" });
+  const seconds = Math.round(sc.end - sc.start);
+  shape("text", { x: box.left, y: 252, fill: "#c3c2b7", "font-size": 12 }, `${seconds}초 전`);
+  shape("text", { x: box.right, y: 252, fill: "#c3c2b7", "font-size": 12, "text-anchor": "end" }, "지금");
+  drawHover(s, sc);
+}
+
+function drawHover(s, sc) {
+  const points = s.history.filter(p => p.distance !== null);
+  if (hoverX === null || !points.length) { tooltip.style.display = "none"; return; }
+  const nearest = points.reduce((a, b) => Math.abs(sc.x(a.time) - hoverX) < Math.abs(sc.x(b.time) - hoverX) ? a : b);
+  const x = sc.x(nearest.time), y = sc.y(nearest.distance);
+  shape("line", { x1: x, x2: x, y1: box.top, y2: box.bottom, stroke: "#c3c2b7" });
+  shape("circle", { cx: x, cy: y, r: 4, fill: "#3987e5", stroke: "#1a1a19", "stroke-width": 2 });
+  tooltip.replaceChildren();
+  const strong = document.createElement("strong");
+  strong.textContent = `${nearest.distance.toFixed(1)}cm`;
+  tooltip.append(strong, ` · ${new Date(nearest.time * 1000).toLocaleTimeString("ko-KR")}`);
+  tooltip.style.display = "block";
+  const percent = x / 640 * 100;
+  tooltip.style.left = percent > 55 ? "" : `calc(${percent}% + 10px)`;
+  tooltip.style.right = percent > 55 ? `calc(${100 - percent}% + 10px)` : "";
+}
+
+const LABELS = {
+  idle: () => "대기 중",
+  countdown: s => `${s.countdown}초 후 학습 시작 — 감시 구역을 비워 주세요`,
+  learning: () => "기준 거리 학습 중",
+  armed: () => "감시 중",
+  alarm: () => "침입 감지!",
+  error: s => s.message,
+};
+
+function cm(value) {
+  return value === null ? "-" : `${value.toFixed(1)}cm`;
+}
+
+function render(s) {
+  const banner = document.getElementById("banner");
+  banner.textContent = LABELS[s.state](s);
+  banner.className = s.state;
+  document.getElementById("warning").textContent = s.warning;
+  document.getElementById("distance").textContent = cm(s.distance);
+  document.getElementById("baseline").textContent = cm(s.baseline);
+  const stopped = s.state === "idle" || s.state === "error";
+  document.getElementById("arm").disabled = !stopped;
+  document.getElementById("disarm").disabled = stopped;
+  draw(s);
+  const body = document.getElementById("events");
+  body.replaceChildren();
+  for (const e of s.events) {
+    const row = body.insertRow();
+    for (const text of [e.time, `${e.distance}cm`, `${e.baseline}cm`]) row.insertCell().textContent = text;
+  }
+}
+
+async function refresh() {
+  try {
+    latest = await (await fetch("/api/status")).json();
+    render(latest);
+  } catch {
+    document.getElementById("banner").textContent = "서버에 연결할 수 없습니다";
+    document.getElementById("banner").className = "error";
+  }
+}
+
+plot.addEventListener("pointermove", event => {
+  const rect = plot.getBoundingClientRect();
+  hoverX = (event.clientX - rect.left) / rect.width * 640;
+  if (latest) draw(latest);
+});
+plot.addEventListener("pointerleave", () => {
+  hoverX = null;
+  if (latest) draw(latest);
+});
+for (const name of ["arm", "disarm"]) {
+  document.getElementById(name).onclick = async () => {
+    await fetch(`/api/${name}`, { method: "POST" });
+    refresh();
+  };
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

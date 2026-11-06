@@ -1,0 +1,4 @@
+__pycache__/
+.lgd-nfy*
+events.csv
+events-sim.csv
